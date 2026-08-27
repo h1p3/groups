@@ -1,0 +1,16 @@
+{{ system }}
+
+Агрегат контекста h: {{ h }}
+Активных узлов: {{ active_count }}
+
+Подтянутые фрагменты:
+{% if fragments %}
+{% for f in fragments %}- [{{ f.id }}] {{ f.text }}
+{% endfor %}
+{% else %}— нет —
+{% endif %}
+
+Хвост генерации:
+{{ tail }}
+
+Задача: {{ task }}

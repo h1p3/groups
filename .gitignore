@@ -1,0 +1,56 @@
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# ----- Тесты / линтеры -----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ----- Виртуальное окружение -----
+.venv/
+venv/
+env/
+Include/
+Lib/
+Scripts/
+share/
+pyvenv.cfg
+
+# ----- Модели (крупные бинарники) -----
+*.gguf
+mmproj-*.gguf
+models/*.gguf
+
+# ----- Бинари llama.cpp (распакованные в корень) -----
+*.dll
+*.exe
+
+# ----- Логи -----
+logs/
+*.log
+llama-server*.log
+
+# ----- Сгенерированное / временное -----
+groups_context.zip
+CACHEDIR.TAG
+v/
+cuda/
+
+# ----- Локальный конфиг -----
+config.yaml
+
+# ----- ОС / IDE -----
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+.DS_Store

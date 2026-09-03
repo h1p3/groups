@@ -22,21 +22,26 @@ flat prompt, related fragments are composed using group operations
   logits level so the model stays on track (e.g. exclude a language).
 - **Three-channel filtration** of pulled context.
 
-It ships three backends:
+It ships two backends:
 
 | Backend    | Description |
 |------------|-------------|
 | `mock`     | Deterministic fake engine (no model). Good for UI/flow tests. |
 | `llamacpp` | Local GGUF via `llama-cpp-python` (raw logits + manual sampling). |
-| `server`   | Remote `llama-server` over HTTP (`/completions` + `/embeddings`). |
+
+> A `server` backend (talking to a remote `llama-server` over HTTP) existed
+> earlier and was removed. The concept constructor, guard mode, and
+> attract/mixing machinery — all still fully working, `llamacpp`-only — need
+> raw pre-sampling logits and a manual sampling loop that an HTTP
+> `logit_bias` API can't provide; that's *why* `server` had to go, not
+> something that went with it. See ARCHITECTURE.md §11 for the full reasoning.
 
 ### Requirements
 
 - Python **3.10+** (tested on 3.12).
-- For `llamacpp`: `llama-cpp-python` (CPU build by default; CUDA build needs a
-  CUDA toolchain / prebuilt wheel).
-- For `server`: a running `llama-server` (e.g. from the
-  [llama.cpp release](https://github.com/ggml-org/llama.cpp/releases)).
+- `llama-cpp-python` (CPU wheel by default; GPU requires a source build
+  against your CUDA toolkit — see *Running on GPU* below). `start.bat`
+  performs this automatically when a CUDA toolkit is detected.
 
 ### Installation
 
@@ -55,11 +60,10 @@ Edit `config.yaml` (local file, git-ignored):
 
 ```yaml
 model:
-  backend: "mock"                 # mock | llamacpp | server
+  backend: "mock"                 # mock | llamacpp
   path: "models/Qwen3VL-4B-Instruct-Q4_K_M.gguf"
-  base_url: "http://127.0.0.1:8090"
   n_ctx: 8192
-  n_gpu_layers: 99                # GPU offload layers (llamacpp/server)
+  n_gpu_layers: 99                # GPU offload layers
   temperature: 0.7
 
 group:
@@ -89,9 +93,6 @@ python -m groupcot chat --backend llamacpp \
     --model models/Qwen3VL-4B-Instruct-Q4_K_M.gguf \
     --exclude-lang zh
 
-# Chat via a remote llama-server
-python -m groupcot chat --backend server --base-url http://127.0.0.1:8090
-
 # Mock engine (no model needed)
 python -m groupcot chat --backend mock
 
@@ -113,24 +114,47 @@ python -m groupcot.gui
 The window opens instantly (a `MockEngine` by default) and, if a model path is
 configured in `config.yaml`, **`LlamaCppEngine` is loaded in a background
 thread** and swapped in automatically once ready. Use the *Модель* tab to
-connect a backend manually, or start a `llama-server`.
+connect a backend manually.
 
-### Deploy — llama-server (recommended for server backend)
+### Running on GPU (NVIDIA)
 
-For Qwen3-VL (vision) you must also pass the multimodal projector:
+The Python `llamacpp` backend can run **entirely on the GPU**. Since
+`llama-cpp-python` only ships CPU wheels on PyPI, build it from source against
+your CUDA toolkit **once**:
 
 ```bash
-llama-server \
-  -m models/Qwen3VL-4B-Instruct-Q4_K_M.gguf \
-  --mmproj models/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf \
-  -c 8192 --port 8090 --embedding --pooling mean -ngl 99
+# 1) Open an MSVC x64 native prompt (provides cl.exe / INCLUDE / LIB)
+call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6
+set PATH=%CUDA_PATH%\bin;%PATH%
+set CMAKE_ARGS=-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=86
+
+# 2) Force a source build (ignores the prebuilt CPU wheel)
+python -m pip install --force-reinstall --no-cache-dir --no-binary llama-cpp-python llama-cpp-python==0.3.35
+
+# 3) Copy CUDA runtime DLLs next to the extension (no PATH tweak at runtime)
+copy "%CUDA_PATH%\bin\cudart64_12.dll"    .venv\Lib\site-packages\llama_cpp\lib\
+copy "%CUDA_PATH%\bin\cublas64_12.dll"    .venv\Lib\site-packages\llama_cpp\lib\
+copy "%CUDA_PATH%\bin\cublasLt64_12.dll"  .venv\Lib\site-packages\llama_cpp\lib\
 ```
 
-- Default port is **8090** (port 8080 is often taken by other services).
-- `--embedding --pooling mean` is required for the `ServerEngine` embeddings.
-- On Windows you can simply run **`start.bat`**, which downloads the model if
-  missing, detects a CUDA vs CPU `llama-server.exe` under `tools\` (or
-  `tools\cuda\`), starts it, and launches the GUI.
+After that, **any `llamacpp` run uses the GPU automatically** — set
+`n_gpu_layers` in `config.yaml` (e.g. `99`). Verify:
+
+```bash
+python -m groupcot info --backend llamacpp --model models/Qwen3VL-4B-Instruct-Q4_K_M.gguf
+# logs: ggml_cuda_init: found 1 CUDA devices ... layer N assigned to device CUDA0
+```
+
+> Do **not** reinstall via `pip install -e .[llamacpp]` afterwards — that would
+> replace your CUDA build with the CPU wheel. Just use `pip install -e .`.
+
+The GUI (`python -m groupcot.gui`) autoloads `LlamaCppEngine` and will use the
+GPU automatically once the CUDA build above is in place.
+
+On Windows you can simply run **`start.bat`**, which downloads the model if
+missing, builds `llama-cpp-python` with CUDA if a toolkit is detected, and
+launches the GUI.
 
 ### Excluding a language
 
@@ -151,7 +175,7 @@ GUI chat tab.
 ### Tests
 
 ```bash
-pytest -q          # 59 tests
+pytest -q          # 91 tests
 ```
 
 ---
@@ -172,21 +196,26 @@ pytest -q          # 59 tests
   уровне logits, удерживая модель в нужном русле (например, исключение языка).
 - **Трёхканальную фильтрацию** подтянутого контекста.
 
-Доступны три бэкенда:
+Доступны два бэкенда:
 
 | Бэкенд    | Описание |
 |-----------|----------|
 | `mock`    | Детерминированный «фейковый» движок (без модели). Для тестов UI/потока. |
 | `llamacpp`| Локальный GGUF через `llama-cpp-python` (raw logits + ручной сэмплинг). |
-| `server`  | Удалённый `llama-server` по HTTP (`/completions` + `/embeddings`). |
+
+> Раньше был ещё `server`-бэкенд (удалённый `llama-server` по HTTP) — убран.
+> Семантический конструктор, guard-режим и механика attract/подмешивания —
+> всё это работает (только на `llamacpp`) и требует сырых logits до
+> сэмплирования и ручного цикла сэмплинга, чего HTTP `logit_bias`-API дать не
+> может — именно **поэтому** ушёл `server`, а не наоборот. Подробности —
+> ARCHITECTURE.md §11.
 
 ### Требования
 
 - Python **3.10+** (проверено на 3.12).
-- Для `llamacpp`: `llama-cpp-python` (по умолчанию CPU-сборка; CUDA-сборка
-  требует CUDA-тулчейн / готовый wheel).
-- Для `server`: запущенный `llama-server` (например, из
-  [релиза llama.cpp](https://github.com/ggml-org/llama.cpp/releases)).
+- `llama-cpp-python` (на PyPI только CPU-wheel; GPU требует сборки из
+  исходников под ваш CUDA-тулчейн — см. *Запуск на GPU* ниже). `start.bat`
+  делает это автоматически при наличии CUDA-тулчейна.
 
 ### Установка
 
@@ -205,11 +234,10 @@ pip install -e .[llamacpp]           # + локальный GGUF-бэкенд
 
 ```yaml
 model:
-  backend: "mock"                 # mock | llamacpp | server
+  backend: "mock"                 # mock | llamacpp
   path: "models/Qwen3VL-4B-Instruct-Q4_K_M.gguf"
-  base_url: "http://127.0.0.1:8090"
   n_ctx: 8192
-  n_gpu_layers: 99                # слои для offload на GPU (llamacpp/server)
+  n_gpu_layers: 99                # слои для offload на GPU
   temperature: 0.7
 
 group:
@@ -239,9 +267,6 @@ python -m groupcot chat --backend llamacpp \
     --model models/Qwen3VL-4B-Instruct-Q4_K_M.gguf \
     --exclude-lang zh
 
-# Чат через удалённый llama-server
-python -m groupcot chat --backend server --base-url http://127.0.0.1:8090
-
 # Mock-движок (модель не нужна)
 python -m groupcot chat --backend mock
 
@@ -263,24 +288,47 @@ python -m groupcot.gui
 Окно открывается мгновенно (`MockEngine` по умолчанию), а если в `config.yaml`
 указан путь к модели, **`LlamaCppEngine` загружается в фоновом потоке** и
 автоматически подменяет движок, как только будет готов. На вкладке *Модель*
-можно подключить бэкенд вручную или запустить `llama-server`.
+можно подключить бэкенд вручную.
 
-### Деплой — llama-server (рекомендуется для server-бэкенда)
+### Запуск на GPU (NVIDIA)
 
-Для Qwen3-VL (мультимодальная) нужно также передать проектор:
+Python-бэкенд `llamacpp` может работать **целиком на видеокарте**. Так как в
+PyPI есть только CPU-wheel, нужно один раз собрать `llama-cpp-python` из
+исходников под ваш CUDA-тулчейн:
 
 ```bash
-llama-server \
-  -m models/Qwen3VL-4B-Instruct-Q4_K_M.gguf \
-  --mmproj models/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf \
-  -c 8192 --port 8090 --embedding --pooling mean -ngl 99
+# 1) Открыть MSVC x64 native prompt (даёт cl.exe / INCLUDE / LIB)
+call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6
+set PATH=%CUDA_PATH%\bin;%PATH%
+set CMAKE_ARGS=-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=86
+
+# 2) Принудительная сборка из исходников (игнорирует CPU-wheel)
+python -m pip install --force-reinstall --no-cache-dir --no-binary llama-cpp-python llama-cpp-python==0.3.35
+
+# 3) Скопировать CUDA runtime-DLL рядом с расширением (PATH не нужен в рантайме)
+copy "%CUDA_PATH%\bin\cudart64_12.dll"    .venv\Lib\site-packages\llama_cpp\lib\
+copy "%CUDA_PATH%\bin\cublas64_12.dll"    .venv\Lib\site-packages\llama_cpp\lib\
+copy "%CUDA_PATH%\bin\cublasLt64_12.dll"  .venv\Lib\site-packages\llama_cpp\lib\
 ```
 
-- Порт по умолчанию — **8090** (8080 часто занят другими сервисами).
-- `--embedding --pooling mean` обязательны для эмбеддингов `ServerEngine`.
-- В Windows достаточно запустить **`start.bat`**: он скачает модель при
-  отсутствии, определит CUDA- или CPU-сборку `llama-server.exe` в `tools\` (или
-  `tools\cuda\`), запустит сервер и откроет GUI.
+После этого **любой запуск `llamacpp` использует GPU автоматически** —
+выставьте `n_gpu_layers` в `config.yaml` (например, `99`). Проверка:
+
+```bash
+python -m groupcot info --backend llamacpp --model models/Qwen3VL-4B-Instruct-Q4_K_M.gguf
+# в логах: ggml_cuda_init: found 1 CUDA devices ... layer N assigned to device CUDA0
+```
+
+> Не переустанавливайте потом через `pip install -e .[llamacpp]` — это заменит
+> CUDA-сборку на CPU-wheel. Используйте просто `pip install -e .`.
+
+GUI (`python -m groupcot.gui`) сам подгружает `LlamaCppEngine` и будет
+использовать GPU автоматически, как только выше сделана CUDA-сборка.
+
+В Windows достаточно запустить **`start.bat`**: он скачает модель при
+отсутствии, соберёт `llama-cpp-python` с CUDA при обнаруженном тулчейне и
+откроет GUI.
 
 ### Исключение языка
 
@@ -301,5 +349,5 @@ llama-server \
 ### Тесты
 
 ```bash
-pytest -q          # 59 тестов
+pytest -q          # 91 тест
 ```

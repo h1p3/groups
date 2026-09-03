@@ -1,7 +1,6 @@
 import json
 import os
 import queue
-import subprocess
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -13,8 +12,6 @@ from .engine import create_engine
 from .engine.mock import MockEngine
 from .groups import Cyclic, FilterRule, VectorAdd
 from .prompts import PromptSet
-
-import httpx
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -28,8 +25,14 @@ class GroupGUI(tk.Tk):
 
         self.cfg = load_config(config_path or (ROOT / "config.yaml"))
         self._q = queue.Queue()
-        self._server_proc = None
         self._text_counter = 0
+        # llama_cpp.Llama is not thread-safe: two threads calling generate()/eval()
+        # on the same context concurrently corrupts its internal KV-cache/logits
+        # state and crashes with a native access violation (observed in practice --
+        # sending a second chat message before the first reply lands). Every
+        # background worker that touches self.engine or self.embed_engine must
+        # hold this lock for the duration of that access.
+        self._engine_lock = threading.Lock()
 
         self.group = Cyclic(64)
         self.store = Store(group=self.group)
@@ -41,7 +44,6 @@ class GroupGUI(tk.Tk):
         self._build_ui()
         self.engine = self._create_default_engine()
         self.after(400, self._poll)
-        self.after(800, self._auto_detect_server)
 
     def _build_ui(self):
         nb = ttk.Notebook(self)
@@ -52,6 +54,7 @@ class GroupGUI(tk.Tk):
         self._build_group_tab(nb)
         self._build_store_tab(nb)
         self._build_run_tab(nb)
+        self._build_constructor_tab(nb)
         self._build_chat_tab(nb)
 
         self.status_label = ttk.Label(self, relief="sunken", anchor="w")
@@ -68,7 +71,7 @@ class GroupGUI(tk.Tk):
             _llamacpp_ok = _Llama is not None
         except ImportError:
             _llamacpp_ok = False
-        for b in ("mock", "server", "llamacpp"):
+        for b in ("mock", "llamacpp"):
             state = "normal" if (b != "llamacpp" or _llamacpp_ok) else "disabled"
             lbl = b if _llamacpp_ok or b != "llamacpp" else f"{b} (не установлен)"
             ttk.Radiobutton(frame, text=lbl, variable=self.backend_var, value=b, state=state).pack(anchor="w", padx=12)
@@ -80,14 +83,9 @@ class GroupGUI(tk.Tk):
         ttk.Entry(row, textvariable=self.model_path_var).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="…", width=3, command=self._browse_model).pack(side="left")
 
-        ttk.Label(frame, text="base_url (server):").pack(anchor="w", pady=(8, 0))
-        self.base_url_var = tk.StringVar(value=self.cfg["model"]["base_url"])
-        ttk.Entry(frame, textvariable=self.base_url_var).pack(fill="x")
-
         btns = ttk.Frame(frame)
         btns.pack(anchor="w", pady=8)
         ttk.Button(btns, text="Подключить движок", command=self._connect_engine).pack(side="left")
-        ttk.Button(btns, text="Запустить llama-server", command=self._start_server).pack(side="left", padx=6)
 
         self.model_status = ttk.Label(frame, text="engine: не подключён")
         self.model_status.pack(anchor="w")
@@ -95,9 +93,9 @@ class GroupGUI(tk.Tk):
         ttk.Label(
             frame,
             text=(
-                "Примечание: Qwen3-VL требует свежий llama.cpp (b6890+), сервер поднимается с --mmproj.\n"
-                "ServerEngine ходит в /completions (grammar) и /embeddings того же llama-server.\n"
-            "Порт 8080 может быть занят httpd — по умолчанию используется 8090."
+                "Примечание: Qwen3-VL требует свежий llama.cpp (b6890+). Только llamacpp-бэкенд "
+                "(прямой in-process доступ к сырым logits) — remote llama-server больше не "
+                "поддерживается, см. ARCHITECTURE.md §11."
             ),
             foreground="#666",
         ).pack(anchor="w", pady=(14, 0))
@@ -131,7 +129,7 @@ class GroupGUI(tk.Tk):
                 eng = LlamaCppEngine(
                     model_path=str(full),
                     n_ctx=self.cfg["model"].get("n_ctx", 8192),
-                    n_gpu_layers=self.cfg["model"].get("n_gpu_layers", 0),
+                    n_gpu_layers=self.cfg["model"].get("n_gpu_layers", 99),
                 )
                 self.after(0, lambda: self._apply_autoload(eng, full.name))
             except Exception as exc:
@@ -146,48 +144,10 @@ class GroupGUI(tk.Tk):
             self.backend_var.set("llamacpp")
             self.model_status.config(text=f"engine: llamacpp подключён (авто, {name})")
 
-    def _auto_detect_server(self):
-        """Попытаться подключиться к уже запущенному llama-server (только если engine ещё mock)."""
-        if not isinstance(self.engine, MockEngine):
-            return
-        url = self.base_url_var.get().strip() or "http://127.0.0.1:8090"
-        try:
-            r = httpx.get(f"{url}/health", timeout=2.0)
-            if r.status_code == 200 and r.json().get("status") == "ok":
-                engine = create_engine("server", base_url=url)
-                engine.embed("ping")
-                self.engine = engine
-                self.backend_var.set("server")
-                self.model_status.config(text=f"engine: server подключён (авто, {url})")
-                return
-        except Exception:
-            pass
-        if isinstance(self.engine, MockEngine):
-            self.model_status.config(text="engine: mock (llamacpp не подключён — фильтры не применяются!)")
-
-    def _check_server_health(self):
-        """Периодическая проверка — жив ли сервер."""
-        from groupcot.engine.server import ServerEngine
-        if isinstance(self.engine, ServerEngine):
-            url = self.engine.base_url
-            try:
-                r = httpx.get(f"{url}/health", timeout=2.0)
-                if r.status_code == 200:
-                    return True
-            except Exception:
-                pass
-            self.model_status.config(text=f"engine: server отвалился ({url})")
-            self.engine = create_engine("mock", embed_dim=getattr(self.group, "dim", 8))
-            return False
-        return True
-
     def _connect_engine(self):
         backend = self.backend_var.get()
         try:
-            if backend == "server":
-                engine = create_engine("server", base_url=self.base_url_var.get().strip() or "http://127.0.0.1:8080")
-                engine.embed("ping")
-            elif backend == "llamacpp":
+            if backend == "llamacpp":
                 engine = create_engine(
                     "llamacpp",
                     model_path=self.model_path_var.get(),
@@ -200,40 +160,6 @@ class GroupGUI(tk.Tk):
             self.model_status.config(text=f"engine: {backend} подключён")
         except Exception as exc:
             self.model_status.config(text=f"ошибка подключения: {exc}")
-
-    def _start_server(self):
-        cuda_exe = ROOT / "tools" / "cuda" / "llama-server.exe"
-        cpu_exe = ROOT / "tools" / "llama-server.exe"
-        if cuda_exe.exists() and (ROOT / "tools" / "cuda" / "ggml-cuda.dll").exists():
-            exe = cuda_exe
-            ngl = self.cfg["model"].get("n_gpu_layers", 99)
-        elif cpu_exe.exists():
-            exe = cpu_exe
-            ngl = 0
-        else:
-            messagebox.showwarning(
-                "llama-server.exe не найден",
-                "Скачайте llama.cpp release и положите в tools\\ или tools\\cuda\\",
-            )
-            return
-        model = ROOT / self.model_path_var.get()
-        if not model.exists():
-            messagebox.showwarning("Модель не найдена", f"Файл не существует: {model}")
-            return
-        cmd = [str(exe), "-m", str(model), "--port", "8090", "--embedding", "--pooling", "mean"]
-        if ngl:
-            cmd += ["-ngl", str(ngl)]
-        mmproj = ROOT / "models" / "mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf"
-        if mmproj.exists():
-            cmd += ["--mmproj", str(mmproj)]
-        logs = ROOT / "logs"
-        logs.mkdir(exist_ok=True)
-        with open(logs / "llama-server.log", "wb") as lf:
-            self._server_proc = subprocess.Popen(
-                cmd, stdout=lf, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW
-            )
-        self.model_status.config(text="llama-server запускается (лог: logs/llama-server.log)")
-        self.after(5000, self._auto_detect_server)
 
     def _build_group_tab(self, nb):
         frame = ttk.Frame(nb)
@@ -344,6 +270,265 @@ class GroupGUI(tk.Tk):
         ttk.Label(frame, text="Результат:").pack(anchor="w", padx=6, pady=(6, 0))
         self.output_text = tk.Text(frame, wrap="word", state="disabled")
         self.output_text.pack(fill="both", expand=True, padx=6, pady=4)
+
+    def _build_constructor_tab(self, nb):
+        """Семантический конструктор (ARCHITECTURE.md §4-6): интент на естественном
+        языке -> self-query движка -> ConceptSpec -> token IDs (V3a лексикон +
+        опционально V3b семантическое расширение), применяется в чате как
+        concept_ids/attract_ids."""
+        frame = ttk.Frame(nb)
+        nb.add(frame, text="Конструктор")
+        self.concept_rules: list[dict] = []
+        self.embed_engine = None
+        self._vocab_index = None
+
+        embed_box = ttk.LabelFrame(
+            frame, text="Embedding-модель для семантического расширения (V3b, опционально)")
+        embed_box.pack(fill="x", padx=6, pady=6)
+        row = ttk.Frame(embed_box)
+        row.pack(fill="x", padx=6, pady=4)
+        self.embed_model_path_var = tk.StringVar(value="")
+        ttk.Entry(row, textvariable=self.embed_model_path_var).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="…", width=3, command=self._browse_embed_model).pack(side="left")
+        ttk.Button(row, text="Подключить", command=self._connect_embed_engine).pack(side="left", padx=(6, 0))
+        self.embed_status = ttk.Label(
+            embed_box,
+            text=("embedding-движок: не подключён — семантическое расширение (если включено у "
+                  "концепта) будет использовать сам движок генерации; на generative-моделях без "
+                  "отдельного обучения под эмбеддинги это часто даёт плохое разделение по смыслу "
+                  "(см. ARCHITECTURE.md §5.5) — рекомендуется небольшая e5/bge/LaBSE GGUF-модель"),
+            foreground="#666", wraplength=900, justify="left",
+        )
+        self.embed_status.pack(anchor="w", padx=6, pady=(0, 6))
+
+        ctrl = ttk.Frame(frame)
+        ctrl.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Button(ctrl, text="+ Добавить концепт", command=self._add_concept_rule).pack(side="left")
+        ttk.Button(ctrl, text="− Удалить", command=self._remove_concept_rule).pack(side="left", padx=6)
+        ttk.Button(ctrl, text="Скомпилировать (self-query)", command=self._compile_concepts).pack(side="left", padx=6)
+
+        self.concept_list = tk.Listbox(frame, height=10)
+        self.concept_list.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.concept_status = ttk.Label(frame, text="Правил: 0 | exclude: 0 токенов | attract: 0 токенов")
+        self.concept_status.pack(anchor="w", padx=6, pady=(0, 6))
+
+        ttk.Label(
+            frame,
+            text=("Каждый концепт компилируется через self-query подключённого движка "
+                  "(ARCHITECTURE.md §4-5): движок сам строит JSON-спецификацию "
+                  "(lexicon/prototypes), лексикон токенизируется (V3a); при включённом "
+                  "семантическом расширении дополнительно подтягиваются ближайшие по эмбеддингу "
+                  "токены (V3b). Результат применяется в чате как concept_ids (exclude) / "
+                  "attract_ids (attract). mock-движок self-query не поддерживает содержательно."),
+            foreground="#666", wraplength=900, justify="left",
+        ).pack(anchor="w", padx=6, pady=(0, 6))
+
+        self._build_guard_section(frame)
+
+    def _build_guard_section(self, frame):
+        """Фаза 4 (ARCHITECTURE.md §5.1.1): guard по целым предложениям, не только
+        токенам — отдельный список концептов с прототипами-предложениями (задаются
+        руками, не self-query — см. секцию), и отдельный, более медленный режим
+        генерации (generate_guarded: reject -> widen mask -> regenerate)."""
+        self.guard_specs: list = []  # list[ConceptSpec], full-sentence prototypes
+        self.guard_enabled_var = tk.BooleanVar(value=False)
+        self.guard_threshold_var = tk.StringVar(value="0.85")
+        self.guard_aggregation_var = tk.StringVar(value="mean")
+        self.guard_max_rejections_var = tk.IntVar(value=5)
+        self.guard_chunk_tokens_var = tk.IntVar(value=20)
+
+        guard_box = ttk.LabelFrame(
+            frame, text="Guard-концепты (Фаза 4 — целые предложения, не только токены)")
+        guard_box.pack(fill="both", expand=True, padx=6, pady=6)
+
+        ctrl2 = ttk.Frame(guard_box)
+        ctrl2.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Button(ctrl2, text="+ Добавить guard-концепт", command=self._add_guard_rule).pack(side="left")
+        ttk.Button(ctrl2, text="− Удалить", command=self._remove_guard_rule).pack(side="left", padx=6)
+        ttk.Checkbutton(ctrl2, text="Включить в чате (строгий режим)",
+                        variable=self.guard_enabled_var).pack(side="left", padx=12)
+
+        self.guard_list = tk.Listbox(guard_box, height=5)
+        self.guard_list.pack(fill="both", expand=True, padx=6, pady=4)
+
+        settings = ttk.Frame(guard_box)
+        settings.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Label(settings, text="threshold:").pack(side="left")
+        ttk.Entry(settings, textvariable=self.guard_threshold_var, width=6).pack(side="left", padx=(2, 10))
+        ttk.Label(settings, text="агрегация:").pack(side="left")
+        ttk.Combobox(settings, textvariable=self.guard_aggregation_var, values=("mean", "max"),
+                     state="readonly", width=6).pack(side="left", padx=(2, 10))
+        ttk.Label(settings, text="max_rejections:").pack(side="left")
+        ttk.Spinbox(settings, from_=1, to=20, textvariable=self.guard_max_rejections_var,
+                   width=5).pack(side="left", padx=(2, 10))
+        ttk.Label(settings, text="chunk_tokens:").pack(side="left")
+        ttk.Spinbox(settings, from_=5, to=100, textvariable=self.guard_chunk_tokens_var,
+                   width=5).pack(side="left", padx=(2, 0))
+
+        ttk.Label(
+            guard_box,
+            text=("Классифицирует КАЖДОЕ сгенерированное предложение по сходству с прототипами "
+                  "(не self-query — прототипы вводятся вручную, по одному на строку). При "
+                  "совпадении — не повтор с той же маской, а self-query по тексту утечки расширяет "
+                  "concept_ids, и предложение перегенерируется. Требует хорошей embedding-модели "
+                  "(поле выше) — на самом чат-движке разделение по смыслу часто неинформативно "
+                  "(ARCHITECTURE.md §5.1.1). Медленнее обычного чата (несколько вызовов модели на "
+                  "предложение) — включайте только когда правда нужно."),
+            foreground="#666", wraplength=900, justify="left",
+        ).pack(anchor="w", padx=6, pady=(0, 6))
+
+    def _add_guard_rule(self):
+        dlg = _ConceptGuardDialog(self)
+        self.wait_window(dlg)
+        if dlg.result:
+            self.guard_specs.append(dlg.result)
+            self._refresh_guard_list()
+
+    def _remove_guard_rule(self):
+        sel = self.guard_list.curselection()
+        if not sel:
+            return
+        del self.guard_specs[sel[0]]
+        self._refresh_guard_list()
+
+    def _refresh_guard_list(self):
+        self.guard_list.delete(0, "end")
+        for spec in self.guard_specs:
+            self.guard_list.insert("end", f"{spec.concept!r} — {len(spec.prototypes)} прототипов")
+
+    def _guard_threshold(self) -> float:
+        try:
+            return float(self.guard_threshold_var.get().replace(",", "."))
+        except ValueError:
+            return 0.85
+
+    def _browse_embed_model(self):
+        path = filedialog.askopenfilename(title="Embedding GGUF модель", filetypes=[("GGUF", "*.gguf")])
+        if path:
+            self.embed_model_path_var.set(path)
+
+    def _connect_embed_engine(self):
+        path = self.embed_model_path_var.get().strip()
+        if not path:
+            messagebox.showwarning("Не указан путь", "Укажите путь к embedding GGUF модели.")
+            return
+        full = (ROOT / path) if not os.path.isabs(path) else Path(path)
+        if not full.exists():
+            messagebox.showwarning("Модель не найдена", f"Файл не существует: {full}")
+            return
+        self.embed_status.config(text="embedding-движок: загружается…")
+
+        def worker():
+            try:
+                from .engine.llamacpp import LlamaCppEngine
+                eng = LlamaCppEngine(model_path=str(full), n_ctx=512,
+                                     n_gpu_layers=self.cfg["model"].get("n_gpu_layers", 99))
+                self._q.put(("embed_engine_ready", (eng, full.name)))
+            except Exception as exc:
+                self._q.put(("embed_engine_error", exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _add_concept_rule(self):
+        dlg = _ConceptDialog(self)
+        self.wait_window(dlg)
+        if dlg.result:
+            self.concept_rules.append(dlg.result)
+            self._refresh_concept_list()
+
+    def _remove_concept_rule(self):
+        sel = self.concept_list.curselection()
+        if not sel:
+            return
+        del self.concept_rules[sel[0]]
+        self._refresh_concept_list()
+
+    def _refresh_concept_list(self):
+        self.concept_list.delete(0, "end")
+        total_exclude = 0
+        total_attract = 0
+        for rule in self.concept_rules:
+            n = len(rule.get("ids") or [])
+            mode = rule["mode"]
+            if mode in ("include", "attract"):
+                total_attract += n
+            else:
+                total_exclude += n
+            sem = " [V3b]" if rule.get("semantic") else ""
+            status = "✓" if rule.get("ids") is not None else "…"
+            self.concept_list.insert("end", f"{status} [{mode}]{sem} {rule['intent']!r} -> {n} токенов")
+        self.concept_status.config(
+            text=f"Правил: {len(self.concept_rules)} | exclude: {total_exclude} токенов | "
+                 f"attract: {total_attract} токенов")
+
+    def _compiled_concept_ids(self) -> set:
+        ids: set = set()
+        for rule in self.concept_rules:
+            if rule["mode"] not in ("include", "attract") and rule.get("ids"):
+                ids |= rule["ids"]
+        return ids
+
+    def _compiled_attract_ids(self) -> set:
+        ids: set = set()
+        for rule in self.concept_rules:
+            if rule["mode"] in ("include", "attract") and rule.get("ids"):
+                ids |= rule["ids"]
+        return ids
+
+    def _compile_concepts(self):
+        if not self.concept_rules:
+            messagebox.showinfo("Нет концептов", "Сначала добавьте хотя бы один концепт.")
+            return
+        if getattr(self, "_compiling_concepts", False):
+            return  # already running -- avoid redundant duplicate self-query calls
+        if isinstance(self.engine, MockEngine):
+            messagebox.showwarning(
+                "mock-движок",
+                "Self-query требует реального движка (llamacpp) — mock вернёт заглушку.")
+        self._compiling_concepts = True
+        threading.Thread(target=self._compile_concepts_worker, daemon=True).start()
+
+    def _compile_concepts_worker(self):
+        # Holds self._engine_lock for the whole compile (self-query calls +
+        # optional VocabIndex build touch self.engine/self.embed_engine
+        # repeatedly) so it can't interleave with a concurrent chat request on
+        # the same not-thread-safe llama_cpp.Llama context.
+        with self._engine_lock:
+            from .engine.constructor import ConceptConstructor
+            engine = self.engine
+            ctor = ConceptConstructor(engine)
+            need_semantic = any(r.get("semantic") for r in self.concept_rules)
+            vocab_index = None
+            if need_semantic:
+                self._q.put(("concept_progress", "Строю/загружаю индекс эмбеддингов словаря (V3b)…"))
+                try:
+                    from .engine.vocab_index import VocabIndex
+                    embed_engine = self.embed_engine  # None -> VocabIndex falls back to `engine` itself
+                    vi = self._vocab_index
+                    if vi is None or vi.engine is not engine or vi.embed_engine is not (embed_engine or engine):
+                        vi = VocabIndex(engine, embed_engine=embed_engine)
+                        vi.build()
+                        self._vocab_index = vi
+                    vocab_index = vi
+                except Exception as exc:
+                    self._q.put(("concept_progress", f"V3b индекс недоступен ({exc}), использую только V3a"))
+
+            for i, rule in enumerate(self.concept_rules):
+                self._q.put((
+                    "concept_progress",
+                    f"[{i + 1}/{len(self.concept_rules)}] self-query: {rule['intent']!r}…"))
+                try:
+                    spec = ctor.construct(rule["intent"], mode=rule["mode"])
+                    vi_arg = vocab_index if rule.get("semantic") else None
+                    ids = ctor.compile(spec, vocab_index=vi_arg)
+                    rule["spec"] = spec
+                    rule["ids"] = ids
+                except Exception as exc:
+                    rule["ids"] = set()
+                    self._q.put(("concept_error", f"{rule['intent']!r}: {exc}"))
+        self._compiling_concepts = False
+        self._q.put(("concept_done", None))
 
     def _apply_group(self):
         gtype = self.group_type_var.get()
@@ -515,13 +700,18 @@ class GroupGUI(tk.Tk):
 
     def _worker(self, task, params):
         try:
-            puller = Puller(self.store, top_k=params["top_k"], threshold=params["threshold"])
-            loop = AutoPullLoop(
-                self.engine, self.store, puller, self.group, prompts=self.prompts,
-                max_steps=params["max_steps"], pull_every=params["pull_every"],
-                max_active=params["max_active"], filters=self.filters,
-            )
-            result = loop.run(task, state=self.state)
+            # See self._engine_lock note in _chat_worker -- ContextLoop drives
+            # self.engine through many generate() calls; must not interleave
+            # with a concurrent chat/concept-compile request on the same
+            # not-thread-safe llama_cpp.Llama context.
+            with self._engine_lock:
+                puller = Puller(self.store, top_k=params["top_k"], threshold=params["threshold"])
+                loop = AutoPullLoop(
+                    self.engine, self.store, puller, self.group, prompts=self.prompts,
+                    max_steps=params["max_steps"], pull_every=params["pull_every"],
+                    max_active=params["max_active"], filters=self.filters,
+                )
+                result = loop.run(task, state=self.state)
             self._q.put(("result", result))
         except Exception as exc:
             self._q.put(("error", exc))
@@ -568,12 +758,22 @@ class GroupGUI(tk.Tk):
                 elif kind == "chat_error":
                     self._append_chat("assistant", f"[error: {payload}]")
                     self._chat_send_btn.config(state="normal")
+                elif kind == "embed_engine_ready":
+                    eng, name = payload
+                    self.embed_engine = eng
+                    self._vocab_index = None
+                    self.embed_status.config(text=f"embedding-движок: подключён ({name})")
+                elif kind == "embed_engine_error":
+                    self.embed_status.config(text=f"embedding-движок: ошибка ({payload})")
+                elif kind == "concept_progress":
+                    self.concept_status.config(text=payload)
+                elif kind == "concept_done":
+                    self._refresh_concept_list()
+                elif kind == "concept_error":
+                    messagebox.showwarning("Ошибка конструктора", str(payload))
         except queue.Empty:
             pass
         self._refresh_state()
-        self._poll_count = getattr(self, "_poll_count", 0) + 1
-        if self._poll_count % 15 == 0:
-            self._check_server_health()
         self.after(400, self._poll)
 
     def _refresh_state(self):
@@ -622,6 +822,11 @@ class GroupGUI(tk.Tk):
             return "break"
 
     def _send_chat(self):
+        # Guards against the Enter-key binding (or a fast double-click) firing a
+        # second request while one is still in flight -- self.engine isn't
+        # thread-safe, and disabling the button alone doesn't block <Return>.
+        if str(self._chat_send_btn["state"]) == "disabled":
+            return
         text = self.chat_input.get("1.0", "end").strip()
         if not text:
             return
@@ -633,43 +838,92 @@ class GroupGUI(tk.Tk):
 
     def _chat_worker(self):
         try:
-            prompt = self._build_chat_prompt()
-            from groupcot.engine.server import ServerEngine
-            from groupcot.engine.llamacpp import LlamaCppEngine
+            # self.engine (and self.embed_engine, used inside _generate_with_guard)
+            # are llama_cpp.Llama-backed and not thread-safe -- hold the lock for
+            # the whole request so a concept-compile or Run-tab task can't
+            # interleave native calls on the same context and crash the process.
+            with self._engine_lock:
+                prompt = self._build_chat_prompt()
+                from groupcot.engine.llamacpp import LlamaCppEngine
 
-            logit_bias = None
-            logits_processor = None
-            blocked_ranges = None
+                logits_processor = None
+                blocked_ranges = None
 
-            if isinstance(self.engine, ServerEngine):
-                logit_bias = self._make_logit_bias()
-            elif isinstance(self.engine, LlamaCppEngine):
-                logits_processor = self._make_llamacpp_logits_processor()
+                if isinstance(self.engine, LlamaCppEngine):
+                    logits_processor = self._make_llamacpp_logits_processor()
 
-            filtered_langs = [f.value for f in self.filters
-                             if f.enabled and f.mode == "logit" and f.pipeline == "output"
-                             and f.type == "language" and f.action == "exclude"]
+                filtered_langs = [f.value for f in self.filters
+                                 if f.enabled and f.mode == "logit" and f.pipeline == "output"
+                                 and f.type == "language" and f.action == "exclude"]
 
-            # Runtime character-level filter: a precomputed token mask is not
-            # enough because BPE contextual decoding can turn "garbage" tokens
-            # into valid CJK characters. We additionally reject any generated
-            # token whose decoded text introduces a blocked codepoint.
-            if filtered_langs:
-                from groupcot.engine.llamacpp import DEFAULT_BLOCKED_RANGES
-                blocked_ranges = DEFAULT_BLOCKED_RANGES
+                # Runtime character-level filter: a precomputed token mask is not
+                # enough because BPE contextual decoding can turn "garbage" tokens
+                # into valid CJK characters. We additionally reject any generated
+                # token whose decoded text introduces a blocked codepoint.
+                if filtered_langs:
+                    from groupcot.engine.llamacpp import DEFAULT_BLOCKED_RANGES
+                    blocked_ranges = DEFAULT_BLOCKED_RANGES
 
-            answer = self.engine.generate(prompt, max_tokens=512, temperature=0.7,
-                                          logit_bias=logit_bias,
-                                          logits_processor=logits_processor,
-                                          blocked_ranges=blocked_ranges)
+                # Семантический конструктор (вкладка «Конструктор»): скомпилированные
+                # concept_ids/attract_ids передаются в engine.generate(...) напрямую.
+                concept_ids = self._compiled_concept_ids() or None
+                attract_ids = self._compiled_attract_ids() or None
 
-            badge = ""
-            if filtered_langs:
-                badge = f" [фильтр: {', '.join(filtered_langs)}]"
+                badge = ""
+                if filtered_langs:
+                    badge += f" [фильтр: {', '.join(filtered_langs)}]"
+                if concept_ids:
+                    badge += f" [concept -{len(concept_ids)}]"
+                if attract_ids:
+                    badge += f" [concept +{len(attract_ids)}]"
+
+                if self.guard_enabled_var.get() and self.guard_specs:
+                    answer, guard_badge = self._generate_with_guard(
+                        prompt, concept_ids, attract_ids,
+                        logits_processor=logits_processor, blocked_ranges=blocked_ranges)
+                    badge += guard_badge
+                else:
+                    answer = self.engine.generate(prompt, max_tokens=512, temperature=0.7,
+                                                  logits_processor=logits_processor,
+                                                  blocked_ranges=blocked_ranges,
+                                                  concept_ids=concept_ids,
+                                                  attract_ids=attract_ids)
 
             self._q.put(("chat_reply", answer + badge))
         except Exception as exc:
             self._q.put(("chat_error", exc))
+
+    def _generate_with_guard(self, prompt, concept_ids, attract_ids, *,
+                             logits_processor, blocked_ranges):
+        """Фаза 4 (ARCHITECTURE.md §5.1.1): generate_guarded вместо одного
+        engine.generate — генерирует чанками, классифицирует каждое законченное
+        предложение против guard_specs, при совпадении расширяет маску через
+        self-query на тексте утечки и перегенерирует ту же позицию."""
+        from .engine.guarded_generation import SentenceConceptGuard, generate_guarded
+
+        embed_src = self.embed_engine or self.engine
+        if not hasattr(embed_src, "embed"):
+            raise RuntimeError(
+                "Guard-режим требует embed() у движка; подключите embedding-модель выше "
+                "или обычный движок с embed()")
+
+        guard = SentenceConceptGuard(
+            embed_src, self.guard_specs,
+            threshold=self._guard_threshold(), aggregation=self.guard_aggregation_var.get())
+
+        result = generate_guarded(
+            self.engine, prompt, guard,
+            max_tokens=512, chunk_tokens=int(self.guard_chunk_tokens_var.get()),
+            max_rejections=int(self.guard_max_rejections_var.get()),
+            concept_ids=concept_ids, attract_ids=attract_ids,
+            vocab_index=self._vocab_index, temperature=0.7,
+            logits_processor=logits_processor, blocked_ranges=blocked_ranges,
+        )
+
+        badge = f" [guard: {len(result.rejected_sentences)} откл.]" if result.rejected_sentences else ""
+        if result.gave_up:
+            badge += " [ФАЗА4: не удалось обойти концепт — попробуйте max_rejections/threshold]"
+        return result.text, badge
 
     def _make_llamacpp_logits_processor(self):
         """Построить LogitsProcessorChain для LlamaCppEngine."""
@@ -701,30 +955,6 @@ class GroupGUI(tk.Tk):
                     chain.add(LanguageRedirect(boost_mask=mask))
 
         return chain if len(chain) > 0 else None
-
-    def _make_logit_bias(self) -> dict[int, float] | None:
-        """Построить logit_bias для ServerEngine из output-фильтров."""
-        from groupcot.engine.server import ServerEngine
-        if not isinstance(self.engine, ServerEngine):
-            return None
-        logit_rules = [f for f in self.filters if f.enabled and f.mode == "logit" and f.pipeline == "output"]
-        if not logit_rules:
-            return None
-        vocab_size = 152064
-        logit_bias: dict[int, float] = {}
-        for rule in logit_rules:
-            if rule.type == "language":
-                try:
-                    lang_ids = self.engine.build_lang_token_ids(rule.value, vocab_size)
-                except Exception:
-                    from groupcot.groups.token_group import TokenGroup
-                    tg = TokenGroup(k=64)
-                    lang_ids = tg.token_ids_for_lang(rule.value, vocab_size)
-                bias = -100.0 if rule.action == "exclude" else 0.0
-                for tid in lang_ids:
-                    if tid < vocab_size:
-                        logit_bias[tid] = bias
-        return logit_bias if logit_bias else None
 
     def _build_chat_prompt(self):
         T = chr(119) + chr(101) + chr(95)  # dummy, not used
@@ -854,6 +1084,116 @@ class _FilterDialog(tk.Toplevel):
             enabled=self.enabled_var.get(),
             depends_on=deps,
         )
+        self.destroy()
+
+
+class _ConceptDialog(tk.Toplevel):
+    """Диалог добавления концепта для семантического конструктора (вкладка «Конструктор»)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Добавить концепт")
+        self.resizable(False, False)
+        self.result = None
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="Интент (естественный язык):").grid(
+            row=0, column=0, sticky="w", pady=4, columnspan=2)
+        self.intent_text = tk.Text(frm, height=3, width=48, wrap="word")
+        self.intent_text.grid(row=1, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+        ttk.Label(frm, text="Режим:").grid(row=2, column=0, sticky="w", pady=4)
+        self.mode_var = tk.StringVar(value="exclude")
+        ttk.Combobox(frm, textvariable=self.mode_var, values=("exclude", "attract"),
+                     state="readonly", width=14).grid(row=2, column=1, sticky="w")
+
+        self.semantic_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="семантическое расширение (V3b, медленнее — строит индекс словаря)",
+                        variable=self.semantic_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
+
+        hint = ("exclude: убрать смысл из вывода | attract: притянуть к смыслу\n"
+                "Пример: forbid the word 'cat'  /  говори только про горы")
+        ttk.Label(frm, text=hint, foreground="#666", justify="left").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(4, 8))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=2)
+        ttk.Button(btns, text="OK", command=self._ok).pack(side="left")
+        ttk.Button(btns, text="Отмена", command=self.destroy).pack(side="left", padx=6)
+
+        self.transient(parent)
+        self.grab_set()
+
+    def _ok(self):
+        intent = self.intent_text.get("1.0", "end").strip()
+        if not intent:
+            messagebox.showwarning("Пустой интент", "Введите текст интента", parent=self)
+            return
+        self.result = {
+            "intent": intent,
+            "mode": self.mode_var.get(),
+            "semantic": self.semantic_var.get(),
+            "spec": None,
+            "ids": None,
+        }
+        self.destroy()
+
+
+class _ConceptGuardDialog(tk.Toplevel):
+    """Диалог добавления guard-концепта для Фазы 4 (вкладка «Конструктор»).
+
+    В отличие от `_ConceptDialog`, прототипы вводятся вручную — self-query не
+    даёт надёжных целых предложений-примеров, а guard'у нужны именно они
+    (ARCHITECTURE.md §5.1.1)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Добавить guard-концепт (Фаза 4)")
+        self.resizable(False, False)
+        self.result = None
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="Название концепта:").grid(
+            row=0, column=0, sticky="w", pady=4, columnspan=2)
+        self.name_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.name_var, width=54).grid(
+            row=1, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+        ttk.Label(frm, text="Прототипы (по одному предложению на строку):").grid(
+            row=2, column=0, sticky="w", pady=4, columnspan=2)
+        self.proto_text = tk.Text(frm, height=6, width=54, wrap="word")
+        self.proto_text.grid(row=3, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+        hint = ("Пример (концепт «поездка к морю»):\n"
+                "поехать на море\nпоехать на океан\nпоехать на рыбалку\nхочу искупаться в море\n\n"
+                "Несколько по-разному сформулированных прототипов работают заметно лучше одного — "
+                "иначе схожесть по шаблону фразы перевешивает схожесть по смыслу "
+                "(проверено эмпирически, см. ARCHITECTURE.md §5.1.1).")
+        ttk.Label(frm, text=hint, foreground="#666", justify="left").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(4, 8))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=2)
+        ttk.Button(btns, text="OK", command=self._ok).pack(side="left")
+        ttk.Button(btns, text="Отмена", command=self.destroy).pack(side="left", padx=6)
+
+        self.transient(parent)
+        self.grab_set()
+
+    def _ok(self):
+        name = self.name_var.get().strip()
+        protos = [line.strip() for line in self.proto_text.get("1.0", "end").splitlines()
+                  if line.strip()]
+        if not name or not protos:
+            messagebox.showwarning(
+                "Заполните поля", "Нужны и название, и хотя бы один прототип", parent=self)
+            return
+        from .engine.constructor import ConceptSpec
+        self.result = ConceptSpec(concept=name, mode="exclude", prototypes=protos)
         self.destroy()
 
 

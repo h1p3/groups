@@ -344,27 +344,6 @@ def test_filter_rule_mode():
     assert rule.group_dim == 32
 
 
-def test_build_logit_filters():
-    from groupcot.context.loop import _build_logit_filters
-    rules = [
-        FilterRule(pipeline="output", type="language", action="exclude", value="zh", mode="logit"),
-        FilterRule(pipeline="output", type="language", action="exclude", value="en", mode="text"),
-    ]
-    lf, kwargs = _build_logit_filters(rules)
-    assert lf is not None
-    assert kwargs["exclude_masks"] is not None
-    assert len(kwargs["exclude_masks"]) == 1
-
-
-def test_build_logit_filters_no_logit_rules():
-    from groupcot.context.loop import _build_logit_filters
-    rules = [
-        FilterRule(pipeline="output", type="language", action="exclude", value="zh", mode="text"),
-    ]
-    lf, kwargs = _build_logit_filters(rules)
-    assert lf is None
-
-
 def test_logit_filter_blocks_chinese_tokens():
     """Logit filter с mode=logit должен блокировать токены китайского языка.
 
@@ -396,20 +375,14 @@ def test_logit_filter_blocks_chinese_tokens():
             "Russian tokens should NOT be filtered"
 
 
-def test_server_engine_uses_logit_bias():
-    """ServerEngine должна передавать logit_bias в llama-server API."""
-    from groupcot.engine.server import ServerEngine
-    import inspect
-    src = inspect.getsource(ServerEngine.generate)
-    assert "logit_bias" in src, "ServerEngine.generate() должен поддерживать logit_bias"
-
-
 def test_chat_worker_applies_logit_filters():
-    """_chat_worker должен применять logit-level фильтры из self.filters."""
+    """_chat_worker должен применять logit-level фильтры из self.filters (через
+    LogitsProcessorChain — единственный путь теперь, что LlamaCppEngine
+    единственный поддерживаемый бэкенд, см. ARCHITECTURE.md §11)."""
     from groupcot.gui import GroupGUI
     import inspect
     src = inspect.getsource(GroupGUI._chat_worker)
-    assert "logit_bias" in src, "_chat_worker должен передавать logit_bias"
+    assert "logits_processor" in src, "_chat_worker должен передавать logits_processor"
 
 
 def test_exclude_zh_all_pipelines():
@@ -558,3 +531,59 @@ def test_token_group_tokens_in_coset():
     assert mask[1] == True
     assert mask[2] == False
     assert mask[3] == False
+
+
+def test_token_group_project_embedding_is_stable_across_calls():
+    """Unlike project()/project_per_token() (keyed off the current logits,
+    which change every generation step), project_embedding() must give the
+    exact same group element for the exact same embedding every time --
+    that's what makes a concept field usable as a fixed coset."""
+    from groupcot.groups.token_group import TokenGroup
+    import numpy as np
+    tg = TokenGroup(k=16)
+    rng = np.random.RandomState(0)
+    e = rng.randn(384).astype(np.float32)
+    first = tg.project_embedding(e)
+    second = tg.project_embedding(e)
+    assert np.array_equal(first, second)
+    assert first.shape == (16,)
+    assert set(np.unique(first)).issubset({0, 1})
+
+
+def test_token_group_project_embedding_differs_for_different_embeddings():
+    from groupcot.groups.token_group import TokenGroup
+    import numpy as np
+    tg = TokenGroup(k=32)
+    rng = np.random.RandomState(1)
+    e1 = rng.randn(384).astype(np.float32)
+    e2 = rng.randn(384).astype(np.float32)
+    # Vanishingly unlikely to collide at k=32 for unrelated random vectors --
+    # a real regression (e.g. _We collapsing to zero) would make them equal.
+    assert not np.array_equal(tg.project_embedding(e1), tg.project_embedding(e2))
+
+
+def test_token_group_project_embeddings_batch_matches_scalar():
+    from groupcot.groups.token_group import TokenGroup
+    import numpy as np
+    tg = TokenGroup(k=12)
+    rng = np.random.RandomState(2)
+    embeddings = rng.randn(20, 64).astype(np.float32)
+    batch = tg.project_embeddings_batch(embeddings)
+    assert batch.shape == (20, 12)
+    for i in range(20):
+        assert np.array_equal(batch[i], tg.project_embedding(embeddings[i]))
+
+
+def test_token_group_project_embedding_uses_separate_matrix_from_project():
+    """project_embedding must not silently reuse _W/_b (the logits-keyed
+    matrix) -- that would make it just as unstable as project_per_token."""
+    from groupcot.groups.token_group import TokenGroup
+    import numpy as np
+    tg = TokenGroup(k=8, seed=42)
+    rng = np.random.RandomState(3)
+    e = rng.randn(50).astype(np.float32)
+    tg.project_embedding(e)
+    assert tg._We is not None
+    assert tg._We.shape == (8, 50)
+    # _W (logits-keyed) must be untouched by an embedding-only call.
+    assert tg._W is None

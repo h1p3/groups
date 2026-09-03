@@ -3,8 +3,12 @@
 Usage:
     python -m groupcot --help
     python -m groupcot chat --backend llamacpp --model path/to/model.gguf
-    python -m groupcot chat --backend server --base-url http://127.0.0.1:8090
     python -m groupcot chat --backend mock
+
+Note: the "server" backend (a remote llama-server over HTTP) was removed —
+see ARCHITECTURE.md §11. It couldn't support raw logits access, the manual
+sampling loop, or the concept/guard/attract machinery this project actually
+needs; llamacpp is the only real backend now, mock the only other one.
 """
 from __future__ import annotations
 
@@ -36,13 +40,18 @@ def cmd_chat(args):
             break
         history.append({"role": "user", "content": user_input})
         prompt = _build_prompt(history)
-        processors = _build_processors(args)
+        processors = _build_processors(args, engine)
+        concept_ids, attract_ids = _build_concept_ids(args, engine)
         kwargs = {"max_tokens": args.max_tokens, "temperature": args.temperature}
         if processors is not None:
             kwargs["logits_processor"] = processors
         blocked = _blocked_ranges_for_args(args)
         if blocked is not None:
             kwargs["blocked_ranges"] = blocked
+        if concept_ids is not None:
+            kwargs["concept_ids"] = concept_ids
+        if attract_ids is not None:
+            kwargs["attract_ids"] = attract_ids
         answer = engine.generate(prompt, **kwargs)
         history.append({"role": "assistant", "content": answer})
         print("Assistant: " + answer + "\n")
@@ -67,13 +76,18 @@ def cmd_benchmark(args):
     prompt = "The capital of France is"
     print("Backend: " + args.backend)
     print("Prompt: " + repr(prompt))
-    processors = _build_processors(args)
+    processors = _build_processors(args, engine)
+    concept_ids, attract_ids = _build_concept_ids(args, engine)
     kwargs = {"max_tokens": 50, "temperature": 0.0}
     if processors is not None:
         kwargs["logits_processor"] = processors
     blocked = _blocked_ranges_for_args(args)
     if blocked is not None:
         kwargs["blocked_ranges"] = blocked
+    if concept_ids is not None:
+        kwargs["concept_ids"] = concept_ids
+    if attract_ids is not None:
+        kwargs["attract_ids"] = attract_ids
     times = []
     for i in range(args.iterations):
         t0 = time.time()
@@ -94,22 +108,21 @@ def _create_engine(args):
             n_ctx=args.n_ctx,
             n_gpu_layers=args.n_gpu_layers,
         )
-    elif args.backend == "server":
-        return create_engine("server", base_url=args.base_url)
     elif args.backend == "mock":
         return create_engine("mock", embed_dim=8)
     else:
         raise ValueError("Unknown backend: " + args.backend)
 
 
-def _build_processors(args):
+def _build_processors(args, engine=None):
     from .engine.logits_chain import LogitsProcessorChain
     from .engine.processors import LanguageRedirect
     if not args.exclude_lang:
         return None
     from .engine.llamacpp import LlamaCppEngine
     from .groups.token_group import TokenGroup
-    engine = _create_engine(args)
+    if engine is None:
+        engine = _create_engine(args)
     if not isinstance(engine, LlamaCppEngine):
         print("Warning: --exclude-lang only works with llamacpp backend")
         return None
@@ -138,6 +151,49 @@ def _blocked_ranges_for_args(args):
     return None
 
 
+def _build_concept_ids(args, engine):
+    """Построить (concept_ids, attract_ids) из --concept через конструктор.
+
+    Возвращает два множества token-ID: для исключения (exclude/constrain) и
+    для притяжения (include/attract). Если --concept не задан — (None, None).
+
+    С ``--semantic-concept`` дополнительно строится/кэшируется
+    ``VocabIndex`` и компиляция расширяется семантическим поиском ближайших
+    токенов по эмбеддингам (V3b, ARCHITECTURE.md §6.3) — это ловит формы,
+    которые лексикон V3a пропускает (плюрал, парафраз).
+    """
+    if not args.concept:
+        return None, None
+    from .engine.constructor import ConceptConstructor
+    ctor = ConceptConstructor(engine)
+    vocab_index = None
+    if getattr(args, "semantic_concept", False):
+        from .engine.vocab_index import VocabIndex
+        vocab_index = VocabIndex(engine, max_candidates=args.concept_vocab_size)
+        print("  Building/loading vocab embedding index (V3b, %d candidates; "
+              "one model call per new candidate, cached after first run)..."
+              % args.concept_vocab_size)
+        vocab_index.build()
+        print("  Vocab index ready: %d candidate tokens" % len(vocab_index.token_ids))
+    concept_ids: set[int] = set()
+    attract_ids: set[int] = set()
+    for intent in args.concept:
+        try:
+            spec = ctor.construct(intent)
+        except Exception as exc:
+            print("  ConceptConstructor failed for %r: %s" % (intent, exc))
+            continue
+        ids = ctor.compile(spec, vocab_index=vocab_index,
+                            top_k=args.concept_topk, min_similarity=args.concept_min_sim)
+        print("  Concept '%s' (mode=%s): %d token IDs"
+              % (spec.concept or intent, spec.mode, len(ids)))
+        if spec.mode in ("include", "attract"):
+            attract_ids |= ids
+        else:
+            concept_ids |= ids
+    return (concept_ids or None, attract_ids or None)
+
+
 def _build_prompt(history):
     lines = []
     lines.append(TAG_SYS)
@@ -154,22 +210,43 @@ def _build_prompt(history):
 def main():
     p = argparse.ArgumentParser(
         prog="groupcot", description="GroupCoT: hypergraph context on groups")
-    p.add_argument("--backend", choices=["server", "llamacpp", "mock"],
+    p.add_argument("--backend", choices=["llamacpp", "mock"],
                    default="mock")
     p.add_argument("--model", default=None, help="GGUF model path (llamacpp)")
-    p.add_argument("--base-url", default="http://127.0.0.1:8090",
-                   help="Server base URL")
     p.add_argument("--n-ctx", type=int, default=8192)
-    p.add_argument("--n-gpu-layers", type=int, default=0)
+    p.add_argument("--n-gpu-layers", type=int, default=99,
+                   help="Layers to offload to GPU (llamacpp backend); matches "
+                        "config.yaml's convention. llama.cpp falls back to CPU "
+                        "automatically if no CUDA build/device is present, so "
+                        "this is safe on CPU-only machines too. Use 0 to force CPU.")
     p.add_argument("--max-tokens", type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--exclude-lang", action="append", default=[],
-                   help="Exclude language tokens (repeatable)")
+
+    filter_parent = argparse.ArgumentParser(add_help=False)
+    filter_parent.add_argument("--exclude-lang", action="append", default=[],
+                               help="Exclude language tokens (repeatable)")
+    filter_parent.add_argument("--concept", action="append", default=[],
+                               help="Semantic concept intent to exclude/include "
+                                    "(repeatable); built via the self-query constructor")
+    filter_parent.add_argument("--semantic-concept", action="store_true",
+                               help="Expand --concept via an embedding-based semantic "
+                                    "neighborhood, not just the literal lexicon (V3b, "
+                                    "ARCHITECTURE.md §6.3); builds+caches a vocab index "
+                                    "on first use, requires an engine with embed()")
+    filter_parent.add_argument("--concept-topk", type=int, default=40,
+                               help="Nearest tokens per seed to pull in with --semantic-concept")
+    filter_parent.add_argument("--concept-min-sim", type=float, default=0.55,
+                               help="Minimum cosine similarity for --semantic-concept expansion")
+    filter_parent.add_argument("--concept-vocab-size", type=int, default=1500,
+                               help="Max candidate tokens embedded into the vocab index "
+                                    "(--semantic-concept); each is one model call on first "
+                                    "build (cached after), so larger is slower to warm up")
 
     sub = p.add_subparsers(dest="command")
-    sub.add_parser("chat", help="Interactive chat")
+    sub.add_parser("chat", parents=[filter_parent], help="Interactive chat")
     sub.add_parser("info", help="Show engine info")
-    bp = sub.add_parser("benchmark", help="Benchmark generation")
+    bp = sub.add_parser("benchmark", parents=[filter_parent],
+                        help="Benchmark generation")
     bp.add_argument("-n", "--iterations", type=int, default=3)
 
     args = p.parse_args()

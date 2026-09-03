@@ -46,12 +46,28 @@ class TokenGroup(Group):
         rng = np.random.RandomState(seed)
         self._W: np.ndarray | None = None
         self._b: np.ndarray = rng.randn(k).astype(np.float32) * 0.1
+        # Separate matrix/stream for project_embedding (§12.2 ARCHITECTURE.md):
+        # project()/project_per_token() key off the CURRENT logits vector, so
+        # a token's element there changes from one generation step to the
+        # next -- fine for "fingerprint the current distribution", wrong for
+        # a stable concept field. _We/_be depend only on the embedding dim
+        # and never change, so the same embedding always lands on the same
+        # group element.
+        self._We: np.ndarray | None = None
+        self._be: np.ndarray | None = None
 
     def _ensure_W(self, vocab_size: int) -> None:
         if self._W is not None and self._W.shape[0] == vocab_size:
             return
         rng = np.random.RandomState(self._seed)
         self._W = rng.randn(vocab_size, self.k).astype(np.float32) * 0.1
+
+    def _ensure_We(self, embed_dim: int) -> None:
+        if self._We is not None and self._We.shape[1] == embed_dim:
+            return
+        rng = np.random.RandomState(self._seed + 1)  # distinct stream from _W/_b
+        self._We = rng.randn(self.k, embed_dim).astype(np.float32) * 0.1
+        self._be = rng.randn(self.k).astype(np.float32) * 0.1
 
     def op(self, a: Any, b: Any) -> Any:
         return np.bitwise_xor(np.asarray(a, dtype=np.int32), np.asarray(b, dtype=np.int32))
@@ -90,6 +106,31 @@ class TokenGroup(Group):
         """Проекция для каждого токена: shape (vocab_size, k)."""
         self._ensure_W(logits.shape[0])
         return (logits[:, None] * self._W[None, :] + self._b[None, :] > 0).astype(np.int32)
+
+    def project_embedding(self, embedding) -> np.ndarray:
+        """Стабильная проекция эмбеддинга в группу: sign(W_e · e + b_e).
+
+        В отличие от `project`/`project_per_token` (зависят от СЫРЫХ logits
+        текущего шага генерации — значит нестабильны между шагами, см.
+        ARCHITECTURE.md §12.2), эта проекция берёт реальный семантический
+        эмбеддинг (например, из `VocabIndex`) и всегда даёт один и тот же
+        элемент группы для одного и того же эмбеддинга — то, что нужно для
+        стабильного определения поля концепта F_C (`tokens_in_coset`).
+        """
+        e = np.asarray(embedding, dtype=np.float32).ravel()
+        self._ensure_We(e.shape[0])
+        scores = self._We @ e + self._be  # (k,)
+        return (scores > 0).astype(np.int32)
+
+    def project_embeddings_batch(self, embeddings: np.ndarray) -> np.ndarray:
+        """Проекция матрицы эмбеддингов (n, embed_dim) → (n, k) элементов
+        группы, векторизованно (см. `project_embedding`)."""
+        arr = np.asarray(embeddings, dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError("embeddings must be a 2D array (n, embed_dim)")
+        self._ensure_We(arr.shape[1])
+        scores = arr @ self._We.T + self._be[None, :]  # (n, k)
+        return (scores > 0).astype(np.int32)
 
     def char_set_to_group_elements(self, chars: str) -> set[tuple[int, ...]]:
         """Множество group elements для набора символов.

@@ -227,8 +227,48 @@ class TokenBias:
         return result
 
 
+class ConceptSuppress:
+    """Exclude a fixed set of token IDs (semantic concept suppression).
+
+    Symmetric counterpart of ``ConceptAttract`` (ARCHITECTURE.md §3.3): removes
+    a concept's tokens from the reachable outputs. Works in the manual sampling
+    path of ``LlamaCppEngine`` and therefore at any temperature.
+    """
+
+    def __init__(self, token_ids: set[int] | None = None):
+        self.token_ids = set(token_ids or [])
+
+    def __call__(self, input_ids, scores):
+        result = scores.copy()
+        for tid in self.token_ids:
+            if tid < len(result):
+                result[tid] = -np.inf
+        return result
+
+
+class ConceptAttract:
+    """Boost a fixed set of token IDs (semantic concept attraction).
+
+    Dual of ``ConceptSuppress`` (ARCHITECTURE.md §3.3): steer generation toward
+    a desired concept without hard-forbidding the rest of the vocabulary.
+    """
+
+    def __init__(self, token_ids: set[int] | None = None, weight: float = 5.0):
+        self.token_ids = set(token_ids or [])
+        self.weight = weight
+
+    def __call__(self, input_ids, scores):
+        result = scores.copy()
+        for tid in self.token_ids:
+            if tid < len(result):
+                result[tid] += self.weight
+        return result
+
+
 # Register built-in processors
 register_processor("LanguageRedirect", LanguageRedirect)
 register_processor("PatternBlock", PatternBlock)
 register_processor("SemanticShift", SemanticShift)
 register_processor("TokenBias", TokenBias)
+register_processor("ConceptSuppress", ConceptSuppress)
+register_processor("ConceptAttract", ConceptAttract)

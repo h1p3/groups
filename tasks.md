@@ -402,3 +402,25 @@ exclude через `logit_bias` (post-hoc, аддитивный dict) — а в�
       переиспользование KV-кэша между чанками в `generate_guarded` — O(n²)
       по общей длине ответа никуда не делось, просто константа на каждую
       переоценку упала на порядок вместе с этим фиксом.
+
+## 17. GUI: include-режим и подмешивание в guard-концептах — ВЫПОЛНЕНО `[x]`
+
+Подробности: ARCHITECTURE.md §14. Backend (`generate_guarded`, §10.1/§12) уже
+умел компилировать include-режимные `guard.concepts` в `mix_ids`/эскалировать
+`mix_alpha`, но GUI не давало создать такой концепт — `_ConceptGuardDialog`
+жёстко ставил `mode="exclude"`, поля `lexicon` не было.
+
+- [x] `_ConceptGuardDialog`: выбор режима exclude/include + поле «Ключевые
+      слова» → `ConceptSpec.lexicon` (обязательно для include, иначе
+      `compile()` даёт пустой набор токенов — заблокировано в диалоге).
+- [x] `_build_guard_section`: `threshold (include)` отдельно от exclude,
+      `mix_alpha`/`mix_alpha_step`, `attract_weight`/`attract_weight_step` —
+      пробрасываются в `generate_guarded(...)`.
+- [x] Badge в чате показывает `[mix: N токенов]`/`[attract: N токенов]`
+      (`GuardResult.mix_ids`/`.attract_ids`), не только счётчик отклонений.
+- [x] `_refresh_guard_list` показывает режим и число ключевых слов.
+- [x] Полный тест-сьют (123/1) без регрессий; GUI собран и
+      проинстанциирован headless без ошибок layout'а.
+- [ ] **Не проверено:** ручная include-генерация на реальной модели именно
+      через GUI (только через прямой вызов `generate_guarded`, §12.7-12.9) —
+      стоит прогнать перед тем как полагаться на неё.

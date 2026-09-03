@@ -334,9 +334,14 @@ class GroupGUI(tk.Tk):
         self.guard_specs: list = []  # list[ConceptSpec], full-sentence prototypes
         self.guard_enabled_var = tk.BooleanVar(value=False)
         self.guard_threshold_var = tk.StringVar(value="0.85")
+        self.guard_include_threshold_var = tk.StringVar(value="0.55")
         self.guard_aggregation_var = tk.StringVar(value="mean")
         self.guard_max_rejections_var = tk.IntVar(value=5)
         self.guard_chunk_tokens_var = tk.IntVar(value=20)
+        self.guard_mix_alpha_var = tk.StringVar(value="0.3")
+        self.guard_mix_alpha_step_var = tk.StringVar(value="0.2")
+        self.guard_attract_weight_var = tk.StringVar(value="5.0")
+        self.guard_attract_weight_step_var = tk.StringVar(value="2.0")
 
         guard_box = ttk.LabelFrame(
             frame, text="Guard-концепты (Фаза 4 — целые предложения, не только токены)")
@@ -353,9 +358,11 @@ class GroupGUI(tk.Tk):
         self.guard_list.pack(fill="both", expand=True, padx=6, pady=4)
 
         settings = ttk.Frame(guard_box)
-        settings.pack(fill="x", padx=6, pady=(0, 6))
-        ttk.Label(settings, text="threshold:").pack(side="left")
+        settings.pack(fill="x", padx=6, pady=(0, 2))
+        ttk.Label(settings, text="threshold (exclude):").pack(side="left")
         ttk.Entry(settings, textvariable=self.guard_threshold_var, width=6).pack(side="left", padx=(2, 10))
+        ttk.Label(settings, text="threshold (include):").pack(side="left")
+        ttk.Entry(settings, textvariable=self.guard_include_threshold_var, width=6).pack(side="left", padx=(2, 10))
         ttk.Label(settings, text="агрегация:").pack(side="left")
         ttk.Combobox(settings, textvariable=self.guard_aggregation_var, values=("mean", "max"),
                      state="readonly", width=6).pack(side="left", padx=(2, 10))
@@ -366,15 +373,30 @@ class GroupGUI(tk.Tk):
         ttk.Spinbox(settings, from_=5, to=100, textvariable=self.guard_chunk_tokens_var,
                    width=5).pack(side="left", padx=(2, 0))
 
+        settings2 = ttk.Frame(guard_box)
+        settings2.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Label(settings2, text="mix_alpha:").pack(side="left")
+        ttk.Entry(settings2, textvariable=self.guard_mix_alpha_var, width=6).pack(side="left", padx=(2, 10))
+        ttk.Label(settings2, text="mix_alpha_step:").pack(side="left")
+        ttk.Entry(settings2, textvariable=self.guard_mix_alpha_step_var, width=6).pack(side="left", padx=(2, 10))
+        ttk.Label(settings2, text="attract_weight (fallback):").pack(side="left")
+        ttk.Entry(settings2, textvariable=self.guard_attract_weight_var, width=6).pack(side="left", padx=(2, 10))
+        ttk.Label(settings2, text="attract_weight_step:").pack(side="left")
+        ttk.Entry(settings2, textvariable=self.guard_attract_weight_step_var, width=6).pack(side="left", padx=(2, 0))
+
         ttk.Label(
             guard_box,
             text=("Классифицирует КАЖДОЕ сгенерированное предложение по сходству с прототипами "
-                  "(не self-query — прототипы вводятся вручную, по одному на строку). При "
-                  "совпадении — не повтор с той же маской, а self-query по тексту утечки расширяет "
-                  "concept_ids, и предложение перегенерируется. Требует хорошей embedding-модели "
-                  "(поле выше) — на самом чат-движке разделение по смыслу часто неинформативно "
-                  "(ARCHITECTURE.md §5.1.1). Медленнее обычного чата (несколько вызовов модели на "
-                  "предложение) — включайте только когда правда нужно."),
+                  "(не self-query — прототипы вводятся вручную, по одному на строку). Концепт "
+                  "может быть exclude (запрещённый смысл) или include (обязательный смысл, "
+                  "ARCHITECTURE.md §5.1/§10) — для include также укажите ключевые слова, они "
+                  "задают начальный набор токенов для притяжения. При нарушении: exclude — "
+                  "self-query по тексту утечки расширяет concept_ids; include — на LlamaCppEngine "
+                  "усиливается mix_alpha (подмешивание вероятности, §12.1), на прочих движках — "
+                  "старый аддитивный attract_weight. Требует хорошей embedding-модели (поле выше) — "
+                  "на самом чат-движке разделение по смыслу часто неинформативно (§5.1.1). Медленнее "
+                  "обычного чата (несколько вызовов модели на предложение) — включайте только когда "
+                  "правда нужно."),
             foreground="#666", wraplength=900, justify="left",
         ).pack(anchor="w", padx=6, pady=(0, 6))
 
@@ -395,13 +417,18 @@ class GroupGUI(tk.Tk):
     def _refresh_guard_list(self):
         self.guard_list.delete(0, "end")
         for spec in self.guard_specs:
-            self.guard_list.insert("end", f"{spec.concept!r} — {len(spec.prototypes)} прототипов")
+            lex = f", {len(spec.lexicon)} ключ.слов" if spec.mode in ("include", "attract") else ""
+            self.guard_list.insert(
+                "end", f"[{spec.mode}] {spec.concept!r} — {len(spec.prototypes)} прототипов{lex}")
+
+    def _guard_float(self, var: tk.StringVar, default: float) -> float:
+        try:
+            return float(var.get().replace(",", "."))
+        except ValueError:
+            return default
 
     def _guard_threshold(self) -> float:
-        try:
-            return float(self.guard_threshold_var.get().replace(",", "."))
-        except ValueError:
-            return 0.85
+        return self._guard_float(self.guard_threshold_var, 0.85)
 
     def _browse_embed_model(self):
         path = filedialog.askopenfilename(title="Embedding GGUF модель", filetypes=[("GGUF", "*.gguf")])
@@ -909,7 +936,8 @@ class GroupGUI(tk.Tk):
 
         guard = SentenceConceptGuard(
             embed_src, self.guard_specs,
-            threshold=self._guard_threshold(), aggregation=self.guard_aggregation_var.get())
+            threshold=self._guard_threshold(), aggregation=self.guard_aggregation_var.get(),
+            include_threshold=self._guard_float(self.guard_include_threshold_var, 0.55))
 
         result = generate_guarded(
             self.engine, prompt, guard,
@@ -917,10 +945,18 @@ class GroupGUI(tk.Tk):
             max_rejections=int(self.guard_max_rejections_var.get()),
             concept_ids=concept_ids, attract_ids=attract_ids,
             vocab_index=self._vocab_index, temperature=0.7,
+            attract_weight=self._guard_float(self.guard_attract_weight_var, 5.0),
+            attract_weight_step=self._guard_float(self.guard_attract_weight_step_var, 2.0),
+            mix_alpha=self._guard_float(self.guard_mix_alpha_var, 0.3),
+            mix_alpha_step=self._guard_float(self.guard_mix_alpha_step_var, 0.2),
             logits_processor=logits_processor, blocked_ranges=blocked_ranges,
         )
 
         badge = f" [guard: {len(result.rejected_sentences)} откл.]" if result.rejected_sentences else ""
+        if result.mix_ids:
+            badge += f" [mix: {len(result.mix_ids)} токенов]"
+        elif result.attract_ids:
+            badge += f" [attract: {len(result.attract_ids)} токенов]"
         if result.gave_up:
             badge += " [ФАЗА4: не удалось обойти концепт — попробуйте max_rejections/threshold]"
         return result.text, badge
@@ -1163,21 +1199,37 @@ class _ConceptGuardDialog(tk.Toplevel):
         ttk.Entry(frm, textvariable=self.name_var, width=54).grid(
             row=1, column=0, columnspan=2, sticky="we", pady=(0, 8))
 
-        ttk.Label(frm, text="Прототипы (по одному предложению на строку):").grid(
-            row=2, column=0, sticky="w", pady=4, columnspan=2)
-        self.proto_text = tk.Text(frm, height=6, width=54, wrap="word")
-        self.proto_text.grid(row=3, column=0, columnspan=2, sticky="we", pady=(0, 8))
+        ttk.Label(frm, text="Режим:").grid(row=2, column=0, sticky="w", pady=4)
+        self.mode_var = tk.StringVar(value="exclude")
+        ttk.Combobox(frm, textvariable=self.mode_var, values=("exclude", "include"),
+                     state="readonly", width=14).grid(row=2, column=1, sticky="w")
 
-        hint = ("Пример (концепт «поездка к морю»):\n"
+        ttk.Label(frm, text="Прототипы (по одному предложению на строку):").grid(
+            row=3, column=0, sticky="w", pady=4, columnspan=2)
+        self.proto_text = tk.Text(frm, height=6, width=54, wrap="word")
+        self.proto_text.grid(row=4, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+        ttk.Label(frm, text="Ключевые слова для include (через запятую):").grid(
+            row=5, column=0, sticky="w", pady=4, columnspan=2)
+        self.lexicon_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.lexicon_var, width=54).grid(
+            row=6, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+        hint = ("Прототипы используются для классификации сгенерированных предложений (оба "
+                "режима). Пример (концепт «поездка к морю», exclude):\n"
                 "поехать на море\nпоехать на океан\nпоехать на рыбалку\nхочу искупаться в море\n\n"
                 "Несколько по-разному сформулированных прототипов работают заметно лучше одного — "
                 "иначе схожесть по шаблону фразы перевешивает схожесть по смыслу "
-                "(проверено эмпирически, см. ARCHITECTURE.md §5.1.1).")
-        ttk.Label(frm, text=hint, foreground="#666", justify="left").grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(4, 8))
+                "(проверено эмпирически, см. ARCHITECTURE.md §5.1.1).\n\n"
+                "Для include ключевые слова обязательны — это начальный (неизменный) набор "
+                "токенов для притяжения/подмешивания (ARCHITECTURE.md §5.1/§10/§12); при "
+                "отклонении предложения набор токенов не растёт, растёт только сила притяжения "
+                "(mix_alpha на LlamaCppEngine, иначе attract_weight).")
+        ttk.Label(frm, text=hint, foreground="#666", justify="left", wraplength=440).grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(4, 8))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=5, column=0, columnspan=2)
+        btns.grid(row=8, column=0, columnspan=2)
         ttk.Button(btns, text="OK", command=self._ok).pack(side="left")
         ttk.Button(btns, text="Отмена", command=self.destroy).pack(side="left", padx=6)
 
@@ -1186,14 +1238,22 @@ class _ConceptGuardDialog(tk.Toplevel):
 
     def _ok(self):
         name = self.name_var.get().strip()
+        mode = self.mode_var.get()
         protos = [line.strip() for line in self.proto_text.get("1.0", "end").splitlines()
                   if line.strip()]
+        lexicon = [w.strip() for w in self.lexicon_var.get().split(",") if w.strip()]
         if not name or not protos:
             messagebox.showwarning(
                 "Заполните поля", "Нужны и название, и хотя бы один прототип", parent=self)
             return
+        if mode == "include" and not lexicon:
+            messagebox.showwarning(
+                "Заполните поля",
+                "Для include нужно хотя бы одно ключевое слово — без него притягивать не к чему",
+                parent=self)
+            return
         from .engine.constructor import ConceptSpec
-        self.result = ConceptSpec(concept=name, mode="exclude", prototypes=protos)
+        self.result = ConceptSpec(concept=name, mode=mode, prototypes=protos, lexicon=lexicon)
         self.destroy()
 
 

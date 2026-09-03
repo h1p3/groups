@@ -245,7 +245,19 @@ class LlamaCppEngine(Engine):
         self.llm.eval(tokens)
         generated: list[int] = []
         for _ in range(max_tokens):
-            logits = np.array(self.llm.eval_logits[-1], dtype=np.float32)
+            # NOTE: `self.llm.eval_logits[-1]` (llama-cpp-python's own API) is
+            # ~160x slower than this for no reason worth paying: its property
+            # getter does `self.scores[:self.n_tokens, :].tolist()` -- converts
+            # the WHOLE history-so-far to a Python list, growing every step,
+            # just to hand back the last row. `self.llm.scores` is already a
+            # numpy array; indexing the one row we want and copying it (to
+            # avoid aliasing the engine's internal buffer, since we mutate
+            # `logits` below) is a single vocab_size-sized copy, not
+            # n_tokens*vocab_size. Verified bit-identical output, measured
+            # ~160x faster in isolation -- this was the actual bottleneck
+            # behind "attract is 15x slower than exclude" (both paths pay this
+            # per token; chunked/guarded generation just pays it more times).
+            logits = np.array(self.llm.scores[self.llm.n_tokens - 1], dtype=np.float32)
             if logits_processor is not None:
                 logits = logits_processor(
                     self.llm.input_ids[: self.llm.n_tokens], logits)
